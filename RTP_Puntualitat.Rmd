@@ -1,0 +1,953 @@
+---
+title: "PRÀCTICA 2 TIPOLOGIA DE DADES - RTP Puntualitat"
+author: "Eva Solernou"
+date: "juny 2020"
+output:
+  word_document: 
+    toc: TRUE
+  html_document: 
+    toc: TRUE
+    number_sections: yes
+lang: ca
+---
+
+```{r carrega de libreries, include=FALSE}
+library(tidyverse)
+library(tidyjson)
+library(lubridate)
+library(jsonlite)
+library(rmarkdown)
+library(ggplot2)
+library(VIM)
+library(cluster)
+library(factoextra)
+library(FactoMineR)
+library(np)
+library(Rtsne)
+```
+
+****
+# 1. INTRODUCCIÓ
+****
+Els autobusos urbans de Reus estan equipats amb un SAE (Sistema d'Ajuda a l'Explotació) que, esquemàticament, consisteix en una balissa GPS muntada a cada autobús que envia cada pocs minuts dades a un servidor, les quals són processades per un software amb múltiples objectius, entre ells estimar els temps de pas reals per parada i oferir-los als usuaris.
+
+El sistema guarda registre històric d'algunes de les dades, fet que fa possible realitzar a posteriori anàlisis més complets del servei i plantejar millores en base als resultats obtinguts. 
+
+S'ha observat en anàlisis anteriors que la línia 20 concentra el major número d'incidències de servei i de queixes dels usuaris. És la línia que es realitza amb més vehicles i la més llarga, i es planteja la pregunta de si aquest fet és degut a que té més retards que les altres línies, o a altres motius com que té més hores de servei i més usuaris (i per tant més volum de queixes).
+
+Per respondre aquesta pregunta hem descarregat del sistema els registres del pas per parada dels autobusos durant els mesos de febrer, març i abril de 2020 (arxiu 'HoraPasoParada.csv). 
+
+Per complementar l'anàlisi, hem incorporat dos conjunts de dades complementaris: per un costat les dades de precipìtació a Reus (descarregades de la web de dades obertes d'aemet en format json), i per altra banda les dades d'unes càmeres de visió artificial que hi ha instal·lades en un punt del recorregut de la línia 20 que registren diversos paràmetres  relacionats amb la fluidesa del trànsit ('sensorsRiera.csv').
+
+Així doncs, aquesta pràctica pretén donar resposta a les següents preguntes:
+
+A. Quina distribució segueix la puntualitat de pas en cada parada?
+
+B. La línia 20 té més retards que la resta?
+
+C. Els retards es veuen afectats per la quantitat de pluja?
+
+D. En quina mesura afecta la congestió del tànsit?
+
+
+****
+# 2. DESCRIPCIÓ DEL DATASET 
+****
+
+El conjunt de dades amb el que treballarem està format per tres datasets que caldrà relacionar:
+
+
+## 2.1. Hores de pas per parada
+L'arxiu s'ha extret de la base de dades del SAE, en concret totes les dades dels mesos de febrer, març i abril d'aquest any. Consta d'un total de 300.556 registres.
+
+No es disposa d'una explicació dels camps, el seu significat s'ha deduït del nom dels camps i del coneixement del sistema. Els que poden ser interessants per l'anàlisi són els següents:
+
+* dtHora_BD: moment previst d'arribada de l'autobús a la parada, segons horaris teòrics (publicats a les guies)
+* dtHora_LlegadaReal: moment real d'arribada a la parada
+* iIdExpedicion: cada valor representa una 'expedició' concreta, una 'volta' de l'autobús al conjunt de parades que ha de recórrer
+* iIdParada: codi de la parada objecte del registre (integrarem el nom de parada provinent d'una altra taula)
+* iIdLinea: codi de la línia que està realitzant el vehicle
+* iIdTrayecto: codi que defineix el recorregut, que pot variar segons l'hora del dia. El més habitual són  el '1' (recorregut complet), el '201' (part de la volta a l'inici de servei) i el '301' (part de la volta al final del servei diari)
+* iIdConductor: codi del conductor
+
+Variables de les quals desconeixem el significat, pot estar relacionat amb el codi de colors que es mostra en pantalla de l'operador, s'intentarà deduir de l'anàlisi descriptiu de dades:
+
+* iTipoAccion: Els valors registrats són 0,1,2,3
+* iEstadoHRLlegada: Els valors registrats són 0,1,2,3,4
+* iEstadoHRSalida: Els valors registrats són 0,1,2,3,4,5
+* iOrdenExpedicion: Indica l'ordre de pas de cada parada en una expedició concreta
+
+```{r carrega de dades de pas per parada, warning=FALSE}
+dades <- as_tibble(read.csv(file = "HoraPasoParada.csv", header = TRUE, sep = ","))
+dades <- dades[,-c(4,6,7,8,15,18,19,22,23,25,26,27)]
+
+# revisem i corregim el tipus de dades
+#str(dades)
+dades$dtHora_BD <- as.POSIXct(dades$dtHora_BD)
+dades$dtHora_LlegadaReal <- as.POSIXct(dades$dtHora_LlegadaReal)
+dades$iIdExpedicion <- as.ordered(dades$iIdExpedicion)
+dades$iIdParada <- as.factor(as.numeric(dades$iIdParada))
+dades$iIdLinea <- as.factor(dades$iIdLinea)
+dades$iIdTrayecto <- as.factor(dades$iIdTrayecto)
+dades$iTipoAccion <- as.factor(dades$iTipoAccion)
+dades$iIdAutobus <- as.factor(dades$iIdAutobus)
+dades$iIdConductor <- as.factor(dades$iIdConductor)
+dades$iEstadoHRLlegada <- as.factor(dades$iEstadoHRLlegada)
+dades$iEstadoHRSalida <- as.factor(dades$iEstadoHRSalida)
+dades$iOrdenExpedicion <- as.ordered(dades$iOrdenExpedicion)
+
+# resum
+summary(dades)
+
+# afegim les dades de nom de parada, que es troben en una altra taula
+# parades.JSON recull les parades en servei actualment
+parades.JSON <- as_tibble(fromJSON("parades.json", simplifyMatrix = TRUE))
+parades <- as_tibble(parades.JSON$stops)
+parades$stop_id <- as.factor(as.numeric(parades$stop_id))
+
+dades <- left_join(dades,parades[,c(1,2)], by=c("iIdParada"="stop_id"))
+dades$stop_name <- as.factor(dades$stop_name)
+
+# paradas.Sae recull les parades registrades al mapa del SAE 
+paradas.Sae <- read.csv("ParadasSae.csv", encoding = "UTF-8")
+paradas.Sae$iIdParada <- as.factor(paradas.Sae$iIdParada)
+
+```
+
+## 2.2. Precipitació diària
+Les dades s'han obtingut del portal de dades obertes de l'Agència Estatal de Meteorologia (https://opendata.aemet.es/centrodedescargas/inicio).
+
+S'ha descarregat un fitxer json amb les dades meteorològiques diàries de l'estació meteorològica anomenada Reus Aeroport, compreses entre el gener i l'abril de 2020, en total 121 registres.
+
+D'aquest arxiu, ens insteressarà el valor de la precipitació diària, que segons s'explica a l'arxiu de metadades, correspon a la variable 'prec':
+* prec: precipitació diària, de 07h a 07h, en mm. (Ip = inferior a 0,1 mm)
+* fecha: data, en format AAAA-MM-DD
+
+
+```{r carrega dades meteorologiques, warning=FALSE}
+aemet <- as_tibble(fromJSON("aemet.json", simplifyMatrix = TRUE))
+  
+# revisem el tipus de dades (només ens interessa data i precipitació)
+#str(aemet)
+aemet$fecha <- as.Date(aemet$fecha)
+
+# hem de canviar les comes per punts en la precipìtació
+aemet$prec <- sapply(aemet$prec,gsub,pattern =",", replace=".")
+aemet$prec <- as.numeric(aemet$prec)
+
+# resum
+summary(aemet$prec)
+summary(aemet$fecha)
+```
+
+Observem que dels `r nrow(aemet)` registres diaris, en  `r nrow(aemet[aemet$prec>0,])` dies ha plogut.
+
+## 2.3. Dades de trànsit
+Les dades s'han obtingut dels registres de les 11 càmeres de visió artificial situades a diferents punts de la ciutat per regular l'accés al casc antic.
+
+La càmara que pot resultar més interessant per estimar la fluïdesa del trànsit és l'anomenada S7, situada al nord de la Riera Miró, monitoritzant el trànsit en sentit Av. St. Jordi.
+
+Segons la informació facilitada, cada sensor SX registra les següents dades, en intervals d'un minut:
+
+Ocupació del tram indicat a la càmera, aquest es parteix en 6 zones e indica el % del temps ocupat durant lectura de dades:
+
+SX_0_20 : Percentatge ocupació de la zona 0 a 20 % del tram.
+
+SX_20_40 : Percentatge ocupació de la zona 20 a 40 % del tram
+
+SX_40_60 : Percentatge ocupació de la zona 40 a 60 % del tram.
+
+SX_60_80 : Percentatge ocupació de la zona 60 a 80 % del tram.
+
+SX_80_100 : Percentatge ocupació de la zona 80 a 100 % del tram.
+
+SX_100_-1 : Percentatge ocupació de la zona de més del 100% del tram.
+
+Dades del tram indicat, a la càmera durant la lectura de dades :
+
+SX_distancia_vehicle : Distància mitjana entre vehicles en el tram (m).
+
+SX_velocitat : Velocitat mitjana dels vehicles en el tram (km/h).
+
+SX_volum : Número de vehicles detectats en el tram.
+
+
+Dels registres, ens interessen els següents camps:
+* sensor: identificació del sensor i paràmetre de lectura
+* value:  valor de lectura, segons la descripció anterior
+* event_timestamp: moment de la lectura
+
+Cal tenir present que les lectures dels paràmetres velocitat i distància entre vehicles no es fan servir actualment i no han estat calibrades.
+
+Donada la gran quantitat de dades generades per 11 sensors amb lectures de 9 paràmetres cada minut, s'ha optat per exportar les dades que continguin una setmana de febrer, que considerarem com a model de comportament del trànsit a la ciutat. Per motius tècnics, s'han facilitat les dades en 4 arxius que cal agrupar.
+
+```{r sensors transit}
+sentilo1 <- as_tibble(read.csv(file="sensorsRiera1.csv", header = TRUE))
+sentilo2 <- as_tibble(read.csv(file="sensorsRiera2.csv", header = TRUE))
+sentilo3 <- as_tibble(read.csv(file="sensorsRiera3.csv", header = TRUE))
+sentilo4 <- as_tibble(read.csv(file="sensorsRiera4.csv", header = TRUE))
+
+# agrupament dades en una sola taula
+sentilo <- rbind(sentilo1,sentilo2,sentilo3,sentilo4)     
+#str(sentilo)
+
+# eliminem les columnes que no aporten informació i revisem format
+sentilo <- sentilo[,-c(4:7)]
+sentilo$event_timestamp <- as.POSIXct(sentilo$event_timestamp)
+
+veloc_S7 <- sentilo %>% 
+  filter(sensor=="S7_velocitat")
+
+dist_veh_S7 <- sentilo %>% 
+  filter(sensor=="S7_distancia_vehicle")
+
+S7_ocup_60_80 <- sentilo %>% 
+  filter(sensor=="S7_60_80")
+
+S7_ocup_80_100 <- sentilo %>% 
+  filter(sensor=="S7_80_100")
+
+S7_100 <- sentilo %>% 
+  filter(sensor=="S7_100_-1")
+```
+
+Són un total de `r nrow(sentilo)` registres.
+
+
+****
+# 3. INTEGRACIÓ I SELECCIÓ DE LES DADES D'INTERÈS
+****
+
+Per relacionar puntualitat i pluja, incorporarem al dataset 'dades' la variable 'prec' del dataset 'aemet'. Com que la dada de precipitació és diària, caldrà repetir-la en tots els valors de pas per parada d'aquell dia.
+
+Per fer la integració, necessitem abans haver creat a 'dades' un camp amb la data sola, sense hora i minut, per buscar la coincidència amb el camp 'fecha' de la taula 'aemet'.
+
+Com que previsiblement voldrem analitzar la puntualitat segons l'hora del dia i el dia de la setmana, creem també aquestes variables. 
+
+```{r integració, warning=FALSE}
+dades$dataR <- as_date(dades$dtHora_LlegadaReal)
+dades$horaR <- hour(dades$dtHora_LlegadaReal)
+dades$minR <- minute(dades$dtHora_LlegadaReal)
+dades$dataT <- as_date(dades$dtHora_BD)
+dades$horaT <- hour(dades$dtHora_BD)
+dades$minT <- minute(dades$dtHora_BD)
+dades$diastna <- as.factor(lubridate::wday(dades$dtHora_LlegadaReal, label=TRUE, week_start=1))
+
+# afegim el nom de parada a partir del codi
+dades <- left_join(dades,paradas.Sae)
+
+# afegim la columna precipitació 
+dades <- left_join(dades,aemet[,c(1,7)], by=c("dataT"="fecha"))
+
+```
+
+Per determinar la puntualitat de pas a cada parada generem una nova variable, anomenada 'retard', que indiqui quants segons passen entre l'hora programada i l'hora real de pas. Aquesta variable pot ser negativa, donat que en alguns casos els vehicles arriben abans d'hora a la parada. En aquests casos, cal que esperin fins l'hora prevista de sortida (valor reflectit en la variable iTiempoEnParada).
+
+```{r càlcul de la puntualitat en parada}
+dades$retard <- as.numeric(dades$dtHora_LlegadaReal-dades$dtHora_BD)
+summary(as.numeric(dades$retard))
+
+dades %>% 
+  filter(retard<2400 & retard>-2400) %>% 
+  filter(iIdLinea==20) %>% 
+  ggplot(aes(x=retard)) +
+  geom_histogram(binwidth = 30)+
+  labs(title = "Retards L20")
+
+dades %>% 
+  filter(retard<2400 & retard>-2400) %>% 
+  filter(iIdLinea!=20) %>% 
+  ggplot(aes(x=retard)) +
+  geom_histogram(binwidth = 30)+
+  labs(title = "Retards altres línies")
+
+dades %>% 
+  filter(retard<600 & retard>-600) %>% 
+  filter(iIdLinea==20) %>% 
+  ggplot(aes(y=retard)) +
+  geom_boxplot(outlier.color = "blue")+
+  labs(title = "Retards L20")
+
+dades %>% 
+  filter(retard<600 & retard>-600) %>% 
+  filter(iIdLinea!=20) %>% 
+  ggplot(aes(y=retard)) +
+  geom_boxplot(outlier.color = "blue")+
+  labs(title = "Retards altres línies")
+
+```
+
+Aquesta primera exploració mostra una distribució de retards similar a una normal,  esbiaixada cap als valors positius, i amb valors extrems molt allunyats dels valors centrals. 
+
+La comparació de la línia 20 respecte les altres línies no sembla indicar que la L20 tingui retards superiors a les altres línies, tot i que més endavant ho analitzarem en profunditat. 
+
+Les dades de fluidesa de trànsit no s'integren en aquest moment donat que són una referència de volum de trànsit setmanal. Si pertoca, s'incorporaran més endavant, comparant els moments de congestió (dia de la setmana i hores punta) amb els de retards.
+
+****
+# 4. NETEJA DE LES DADES
+****
+
+## 4.1. Zeros i elements buits
+En aquest punt analitzem la presència de valors que puguin indicar una manca de dades o lectures errònies.
+
+```{r missing data 1}
+# veiem quants NA tenim a les dades
+sapply(dades, function(x) sum(is.na(x)))
+sapply(sentilo, function(x) sum(is.na(x)))
+
+```
+
+No tenim valors perduts a cap de les variables.
+
+Tenint en compte que recollim dades llegides d'instruments, és fàcil que hi hagi valors numèrics que indiquin pèrdua de dades, com valors registrats que no formin part del domini de la variable. Mirem d'identificar-los amb la funció summary, que ens indicarà els valors extrems de cada variable.
+
+```{r missing data 2}
+summary(dades)
+summary(sentilo)
+
+# veiem quants casos tenen value -1, que indica error de lectura, i els eliminem de l'anàlisi
+sentilo %>% 
+  filter(value==-1) %>% 
+  select(sensor, event_timestamp) %>% 
+  summary()
+
+sentilo <- sentilo[sentilo$value!=-1,]
+
+dist_veh_S7 <- dist_veh_S7 %>% 
+  filter(value!=-1)
+
+```
+
+Amb el resum de valors de la taula 'dades' observem que els temps i volums de precipitacions registrats són positius, que les dates estan dins els intervals analitzats, i les dades que defineixen el servei també estan dins el domini.
+
+En canvi, al resum de la taula 'sentilo' observem per un costat valors dels sensors de -1, que poden indicar mesura errònia, i per l'altre un valor màxim molt elevat que caldrà analitzar a l'apartat de valors extrems. Els valors -1 corresponen tots a mesures de distància entre vehicles. Donat que aquests registres no aporten cap informació, procedim a eliminar-los. Les dades de sensors passen de 800.000 registres a 757.667.
+
+## 4.2. Valors extrems de la variable retard
+
+A l'exploració preliminar de la variable 'retard' ja apareixia una quantitat important de valors extrems, aprofundirem en el seu estudi per decidir si són o no valors legítims per l'anàlisi que volem realitzar.
+
+De la funció summary observem una gran diferència entre la mitjana (`r mean(dades$retard)`) i la mediana (`r median(dades$retard)`), que assenyala un biaix de la distribució cap als valors positius. 
+
+```{r outliers retard}
+summary(dades$retard)
+
+retard.bp <- boxplot(dades$retard)
+# valors del diagrama de caixa:
+retard.bp$stats
+
+# taula resum dels valors extrems en retards
+
+parades.out <- dades %>% 
+  filter(retard %in% retard.bp$out) %>% 
+  group_by(iIdParada, sDenominacion, iIdLinea) %>% 
+  summarise(
+    casos=n(),
+    retard.avg=round(mean(retard),1),
+    retard.median=median(retard)
+  )
+    
+# Conmbinacions parada línia amb més outliers
+knitr::kable(head(arrange(parades.out,desc(parades.out$casos)), n=20))
+
+
+# Conmbinacions parada línia amb arribades d'autobus abans d'hora
+knitr::kable(head(arrange(parades.out,parades.out$retard.avg), n=20))
+
+
+# Quantitat d'outliers per parada
+hist(parades.out$casos, breaks = 500, col="blue", main="Quantitat d'outliers per parada", xlab = "número de valors extrems", ylab = "quantitat de parades")
+
+hist(parades.out$casos, breaks = 500, xlim = c(0,400), col="blue", main="Quantitat d'outliers per parada", xlab = "número de valors extrems", ylab = "quantitat de parades")
+
+hist(parades.out$retard.median, breaks = 100, col="red", main="mediana de retards en els valors extrems", xlab = "mediana de retard", ylab = "quantitat de parades")
+
+# eliminem els registres amb valors extrems de retard negatius
+dades.clean <- dades %>%   filter(!(retard %in% retard.bp$out))
+```
+Dels llistats i histogrames anteriors observem que:
+
+* Les parades amb més quantitat de valors extrems són Mas Abelló 1 i Barri Montserrat. A més, els valors centrals dels retards en aquestes parades són negatius
+* Altres parades amb retards extrems negatius són Misericòrdia, Cementiri, Tanatori, etc.
+
+Del coneixement del servei sabem que aquestes parades són "de regulació": parades on s'envia l'autobús saltant-se part de la ruta per a posar-se en hora, normalment quan porta més de deu minuts de retard respecte l'horari teòric, i si va molt a prop d'algun altre autobus de la línia.  
+
+En aquests casos és normal que el sistema registri un horari d'arribada molt diferent al previst, però és una situació forçada per reconduir horaris, de manera que cal eliminar aquests registres de l'anàlisi. A l'histograma veiem que es dóna en poques ocasions, correspon als valors de mediana entre -400 i -600, aproximadament. En aquest pas hem eliminat aproximadament el 7% dels registres.
+
+En canvi, si analitzem les parades amb valors extrems de retards positius, veiem que són parades diverses i que es dóna una gran quantitat de vegades, especialment retards entre 600 i 900 segons, que corresponen a 10-15 minuts i pel coneixement del servei podem dir que són situacions que es dónen en ocasions. 
+
+En aquest cas, optem per mantenir tots els registres positius, encara que siguin valors extrems, donat que l'objecte de l'anàlisi és justament estudiar-los.
+
+
+## 4.3. Valors extrems en sensors
+
+Per analitzar els valors dels sensors que ens interessen cal prèviament seleccionar el sensor i paràmetre que volem estudiar i filtrar-lo en una nova taula.
+
+Per analitzar les afectacions al servei de bus urbà ens podrien ser útils la velocitat mitjana, la distància entre vehicles, el percentatge de temps d'ocupació del 60 al 80% del tram, del 80 al 100 % del tram i el del 100% del tram, tots ells del sensor S7, situat entre les parades Dom Bosco 1 i Pompeu Fabra 1. Ja disposem de les taules específiques, creades a l'apartat de càrrega de dades. No es poden unificar en una sola taula perquè les mesures estan preses en moments diferents, no són diferents paràmetres d'un mateix esdeveniment, sinó esdeveniments diferents.
+
+```{r outliers sensors, warning=FALSE}
+# velocitat mitjana
+summary(veloc_S7$value)
+
+veloc_S7 %>% 
+  filter(value>=0) %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram()+
+  labs(title = "histograma de velocitats S7 (amb zeros i outliers)")
+
+# les lectures =0 són eliminades dels registres, per interpretar que són lectures sense vehicles, no és creïble que els vehicles estiguin sempre aturats
+veloc_S7 <- veloc_S7 %>% 
+  filter(value!=0)
+
+veloc_S7 %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram()+
+  labs(title = "histograma de velocitats S7 (amb outliers)")
+
+summary(boxplot(veloc_S7$value)$out)
+
+# eliminem els valors extrems segons el boxplot, tots a la part alta de velocitats
+veloc_S7 <- veloc_S7 %>% 
+  filter(!(value %in% boxplot(veloc_S7$value)$out))
+
+hist(veloc_S7$value, col="blue", main="velocitat mitjana S7")
+
+# distància entre vehicles
+summary(dist_veh_S7$value)
+hist(dist_veh_S7$value, main="distància entre vehicles, amb outliers")
+
+dist_veh_S7 %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  labs(title = "histograma de distàncies entre vehicles")
+
+# valors extrems, no els eliminem perquè estan en el domini de la variable
+summary(boxplot(dist_veh_S7$value)$out)
+
+# ocupacions de carril, no s'observen valors erronis o extrems
+summary(S7_100$value)
+summary(S7_ocup_80_100$value)
+summary(S7_ocup_60_80$value)
+
+S7_ocup_60_80 %>% 
+  filter(value>0) %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  labs(title="histograma ocupació 60-80% tram")
+
+S7_ocup_80_100 %>% 
+  filter(value>0) %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  labs(title="histograma ocupació 80-100% tram")
+
+S7_100 %>% 
+  filter(value>0) %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  labs(title="histograma ocupació >100% tram")
+
+```
+
+****
+# 5. ANÀLISI DE LES DADES
+****
+
+## 5.1. Selecció dels grups de dades que es volen analitzar
+
+
+La variable objecte de l'anàlisi és la variable retard (del dataset dades.clean).
+
+En un dels anàlisis, volem determinar quines de les diferents variables que tenim disponibles influeixen en els retards, i en quina mesura, així que treballarem amb aquestes variables, que són totes les que d'entrada són susceptibles d'influir:
+
+* retard
+* dataT
+* horaT
+* minT
+* diastna
+* expedicio
+* línia
+* parada
+* ordre.parada
+* ordre.expedicio
+* conductor
+* prec
+
+
+```{r  selecció de variables}
+
+dades.w <- dades.clean[ , c("retard", "dataT","horaT", "minT", "diastna", "iIdExpedicion", "iIdLinea", "sDenominacion", "iOrden", "iOrdenExpedicion","iIdConductor","prec")]
+
+dades.w$iOrden <- ordered(dades.w$iOrden)
+dades.w$horaT <- ordered(dades.w$horaT)
+dades.w$minT <- ordered(dades.w$minT)
+
+```
+
+El conjunt de dades consta de `r nrow(dades.w)` registres. En aquest punt realitzarem algunes visualitzacions per intentar observar possibles relacions, però un volum de dades tan gran dificulta la comprensió d'algunes gràfiques, de manera que en ocasions treballarem amb una mostra de les dades, del tipus SRSWOR.
+
+```{r mostra i gràfiques}
+
+# mostra de 500 registres
+dades.sample <- dades.w[sample(nrow(dades.w),500), ]
+summary(dades.sample)
+
+# gràfica de punts entre variables amb distinció de línia per color
+plot(dades.sample[ ,c("retard", "horaT", "diastna", "prec")], col=dades.sample$iIdLinea)    
+plot(dades.sample[ ,c("retard", "iOrden", "iOrdenExpedicion")], col=dades.sample$iIdLinea)
+
+# gràfica de punts entre variables amb distinció de conductor per color
+plot(dades.sample[ ,c("retard", "horaT", "diastna", "prec")], col=dades.sample$iIdConductor)    
+plot(dades.sample[ ,c("retard", "iOrden", "iOrdenExpedicion")], col=dades.sample$iIdConductor)
+
+# histograma de retards en funció de la línia
+dades.w %>% 
+  ggplot(aes(retard, fill=iIdLinea)) +
+  geom_histogram(binwidth = 10) 
+
+dades.w %>% 
+  ggplot(aes(retard, fill=iIdLinea)) +
+  geom_histogram(binwidth = 10) +
+  facet_wrap(dades.w$iIdLinea) 
+
+# histograma de retards en funció del conductor
+dades.w %>% 
+  ggplot(aes(retard, fill=iIdLinea)) +
+  geom_histogram(binwidth = 10) +
+  facet_wrap(dades.w$iIdConductor)
+
+# histograma de retards en funció de l'ordre d'expedició
+dades.w %>% 
+  ggplot(aes(retard, fill=iIdLinea)) +
+  geom_histogram(binwidth = 10) +
+  facet_wrap(dades.w$iOrdenExpedicion)
+
+# histograma de retards en funció de l'ordre de parada
+#dades.w %>% 
+#  ggplot(aes(retard, fill=iIdLinea)) +
+#  geom_histogram(binwidth = 10) +
+#  facet_wrap(dades.w$iOrden)
+  
+#  mitjana de retard per ordre de parada i línia
+#dades.w %>% 
+ # ggplot(aes(x=iOrden, colour=iIdLinea)) +
+  #geom_bar(dades.w$retard)
+
+# boxplot de retards en funció de línia
+dades.w %>% 
+  ggplot(aes(y=fct_reorder(iIdLinea, retard, FUN = median, na.rm=TRUE, .desc = TRUE), x=retard))+
+  geom_boxplot(aes(fill=fct_reorder(iIdLinea, retard, FUN = median, na.rm=TRUE, .desc = TRUE)), notch = TRUE, varwidth = TRUE) +
+  labs(title="boxplot de retard per línia", y="Línia" ) +
+  scale_fill_discrete(guide=guide_legend(title="Línia"))
+
+# boxplot de retards en funció del conductor
+dades.w %>% 
+  ggplot(aes(y=fct_reorder(iIdConductor, retard, FUN = median, na.rm=TRUE, .desc = TRUE), x=retard))+
+  geom_boxplot(varwidth = TRUE) +
+  labs(title="boxplot de retard per conductor", y="Conductor" ) +
+  scale_fill_discrete(guide=guide_legend(title="Línia"))
+
+# visualitzem si la distribució dels retards s'acosta a una distribució normal
+qqnorm(dades.sample$retard, main="Gràfica Q-Q per la variable retard")
+qqline(dades.sample$retard, col="red", lwd=3)
+```
+
+Sembla que la distribució de retards s'allunya de la distribució normal, especialment en els extrems. Això pot ser degut a que no hem eliminat els valors extrems. 
+
+Repetim la visualització aquest cop amb la distribució de retards sense valors extrems:
+
+```{r normalitat sense outliers}
+out.ret.w <- boxplot.stats(dades.w$retard)$out
+summary(out.ret.w)
+
+dades.w.sense.out <- dades.w %>% 
+  filter(!(retard %in% out.ret.w))
+
+qqnorm(dades.w.sense.out$retard, main="Gràfica Q-Q per la variable retard, sense outliers")
+qqline(dades.w.sense.out$retard, col="red", lwd=3)
+```
+
+La distribució de retards sense valors extrems  presenta un millor ajust a una distribució normal però no sembla que la segueixi.
+
+
+Dels histogrames i diagrames de caixa anteriors observem que sembla que els retards es veuen influits per:
+
+* hora
+
+* dia de la setmana
+
+* línia
+
+* ordre de parada
+
+* conductor
+
+En canvi, la precipitació no sembla influir.
+
+La variable que representa l'ordre d'expedició també sembla influir clarament, però buscant explicació a la quantitat anormal de zeros s'observa que quan es desvia un autobús de la ruta per recuperar horari, s'assigna un zero com si fos una primera expedició. Això pot confondre els resultats. 
+
+Pel que fa a la variable ordre, que representa la posició ordenada de les parades a cada línia, veiem que es pot millorar l'exactitud de la seva importància si creem una nova variable que la normalitzi en relació amb la quantitat de parades de la línia objecte de la mesura (en una parada poden passar diverses línies). 
+
+Creem per tant una nova parada que contingui la posició relativa entre 0 i 1. Cal tenir present que les línies són circulars, de manera que sobre el 50% del recorregut hi ha un final de línia camuflat, on l'autobús disposa d'un temps de coixí per posar-se en hora. 
+
+```{r nova variable ordre.norm, warning=FALSE}
+
+# table(dades.w$iOrden,dades.w$iIdLinea)
+
+for (a in levels(dades.w$iIdLinea)) {
+  # número de parades de cada línia
+  assign(paste0("max.L",a),max(as.numeric(dades.w$iOrden[dades.w$iIdLinea==a])))
+}
+
+# afegim una columna amb el número de parades total de la línia 
+for (i in seq(nrow(dades.w))) {
+  a=get(paste0("max.L",dades.w$iIdLinea[i]))
+  dades.w$ordre.max[i]=as.numeric(a)
+#  dades.w$ordre.norm[i]=round(dades.w$iOrden[i]/as.numeric(a),2)
+}
+ 
+# afegim una variable amb la posició de la parada respecte el total de la línea 
+for (i in seq(nrow(dades.w))) {
+  dades.w$ordre.norm[i] <- as.numeric(dades.w$iOrden[i])/dades.w$ordre.max[i]
+}
+
+dades.w[sample(nrow(dades.w),500), ] %>% 
+  ggplot(aes(x=ordre.norm, y=retard)) +
+  geom_point(mapping = aes(color=iIdConductor), show.legend = FALSE) +
+  facet_wrap(~iIdLinea) + 
+  labs(title="Retard per ordre de parada normalitzat i per conductor (mostra n=500)")
+    
+dades.w[sample(nrow(dades.w),500), ] %>% 
+  ggplot(aes(x=ordre.norm, y=retard)) +
+  geom_point(mapping = aes(color=iIdConductor), show.legend = FALSE) +
+  facet_wrap(~diastna) + 
+  labs(title="Retard per ordre de parada normalitzat i per dia de la setmana (mostra n=500)")
+
+
+```
+
+
+## 5.2. Comprovació de la normalitat i homogeneïtat de la variància.
+
+
+Apliquem a les dues variables numèriques (retard i precipitació) els test de Kolmogorov-Smirnov i de Shapiro-Wilk, que assumeixen com a hipòtesis nul·la que les dades segueixen una distribució normal.
+
+```{r comprovació normalitat, warning=FALSE}
+
+ks.test(dades.w$retard, pnorm, mean(dades.w$retard, sd(dades.w$retard)))
+ks.test(dades.w$prec, pnorm, mean(dades.w$prec, sd(dades.w$prec)))
+
+# el test de Shapiro-Wilk està limitat a una mostra de tamany 5000
+dades.sample5000 <- dades.w[sample(nrow(dades.w),5000), ]
+shapiro.test(dades.sample5000$retard)
+shapiro.test(dades.sample5000$prec)
+
+```
+
+El p-valor obtingut en tots els casos és inferior al nivell de significació 0,05, de manera que rebutgem la hipòtesis nul·la i concloem que les dades no segueixen una distribució normal.
+
+No obstant, donat el tamany de la mostra i aplicant el teorema central del límit, podem considerar que la distribució de la mitjana de retards segueix una distribució normal de mitjana = mitjana(retards) i variança = sd(retards)^2/N.
+
+Per comprovar l'homocedasticitat de la variable retard segons els difernts factors, apliquem el test de Fligner-Killeen, ja que les dades no compleixen amb la condició de normalitat.
+
+```{r comprovació homocedasticitat}
+fligner.test(retard~iIdLinea, data=dades.w)
+fligner.test(retard~iIdConductor, data=dades.w)
+fligner.test(retard~iOrden, data=dades.w)
+```
+
+Donat que en tots els casos el p-valor és inferior al nivell de significació, es rebutja la hipòtesis nul·la d'homocedasticitat, i es conclou que el retard presenta variances estadísticament diferents segons la línia, conductor i ordre de parada.
+
+
+## 5.3. Aplicació de proves estadístiques per comparar els grups de dades. 
+
+### 5.3.1. Contrast d'hipòtesis: la L20 té una distribució de retards diferent a les altres línies?
+
+Pel teorema central del límit podem aplicar proves paramètriques per determinar si hi ha diferències significatives en el retard entre els grups definits per les altres variables, de manera que podem aplicar t-test. 
+
+Hipòtesis nul·la: mitjana de retards de la L20 = mitjana de retards de la resta de línies.
+
+```{r contrast hipòtesis t test}
+# creació dels dos grups diferenciant L20 de la resta
+for (i in seq(nrow(dades.w))) {
+  if (dades.w$iIdLinea[i]==20) {
+    dades.w$isL20[i] = 1
+  } else {
+    dades.w$isL20[i] = 0  
+  }
+  }
+
+# contrast d'hipòtesis
+t.test(retard~isL20, data=dades.w)
+wilcox.test(retard~isL20, data=dades.w)
+```
+
+Obtenim un p-valor més petit que el nivell de significació, fet que implica que hi ha diferències significatives entre els retards de la L20 i de la resta de línies, tot i que els retards són en sentit contrari de l'esperat, en resulta que la L20 té menys retards de mitjana (81 segons) que la resta de línies (104 segons). 
+El resultat coincideix si apliquem les proves de Wilcoxon i Mann-Whitney per a dades que no segueixen una distribució normal.
+
+Donat que tenim diverses línies, volem aprofundir en la variació de la mitjana de retards en elles, pel que apliquem un test ANOVA, tant pel que fa a les línies com a les altres variables categòriques.
+
+```{r anova retard}
+res.aov.linea <- aov(retard~iIdLinea, data = dades.w)
+summary(res.aov.linea)
+
+res.aov.cond <- aov(retard~iIdConductor, data = dades.w)
+summary(res.aov.cond)
+
+res.aov.exp <- aov(retard~iOrdenExpedicion, data = dades.w)
+summary(res.aov.exp)
+
+res.aov.hora <- aov(retard~horaT, data = dades.w)
+summary(res.aov.hora)
+
+res.aov.min <- aov(retard~minT, data = dades.w)
+summary(res.aov.min)
+
+res.aov.parada <- aov(retard~sDenominacion, data = dades.w)
+summary(res.aov.parada)
+
+summary(aov(retard~iIdConductor+iIdLinea+ordre.norm+horaT+diastna+sDenominacion, data=dades.w))
+
+```
+
+En tots els casos s'obté que els retards són estadísticament diferent segons els grups (línia, conductor, expedició, hora, minut, parada).
+
+Repetim l'anàlisi sense valors extrems (en l'apartat de preparació de dades havíem decidit mantenir tots els valors extrems positius), que podrien emmascarar diferències no significatives en la majoria de casos.
+
+```{r anova retard sense outliers}
+
+res.aov.linea.o <- aov(retard~iIdLinea, data = dades.w.sense.out)
+summary(res.aov.linea.o)
+
+res.aov.cond.o <- aov(retard~iIdConductor, data = dades.w.sense.out)
+summary(res.aov.cond.o)
+
+res.aov.exp.o <- aov(retard~iOrdenExpedicion, data = dades.w.sense.out)
+summary(res.aov.exp.o)
+
+res.aov.hora.o <- aov(retard~horaT, data = dades.w.sense.out)
+summary(res.aov.hora.o)
+
+res.aov.min.o <- aov(retard~minT, data = dades.w.sense.out)
+summary(res.aov.min.o)
+
+res.aov.parada.o <- aov(retard~sDenominacion, data = dades.w.sense.out)
+summary(res.aov.parada.o)
+
+summary(aov(retard~iIdConductor+iIdLinea+horaT+diastna+sDenominacion, data=dades.w.sense.out))
+
+```
+
+
+Es confirma que la mitjana dels retards és diferent en cadascun dels grups.
+
+Els valors de F indiquen que les diferències més grans es donen en l'ordre.norm seguides a molta diferència per la línia, l'hora i el conductor.
+
+
+### 5.3.2. PCA
+
+Aplicarem la tècnica de l'Anàlisi de Components Principals per veure quins factors són els que influleixen més en el retard mesurat a cada parada.
+Aquest mètode treballa amb similituds i distàncies. Les dades haurien d'estar prèviament normalitzades per comparar entre els grups. 
+Només es pot aplicar a les variables numèriques.
+
+
+```{r PCA, warning=FALSE}
+# normalitzem les variables retard, precipitació, ordre de parada relatiu a la línia
+dades.w.norm <- as.tibble(scale(dades.w[,c(1,12,14)]))
+
+# afegim les variables categòriques
+dades.w.norm <- cbind(dades.w.norm,dades.w[,c(2:5,7,10,11)])
+
+PCA.dades.norm <- prcomp((dades.w.norm[,c(1:3)]))
+summary(PCA.dades.norm)
+
+# matriu de canvi de coordenades
+PCA.dades.norm$rotation
+```
+
+El resultat d'aquest anàlisi indica que no hi ha reducció de dimensionalitat, tant les variables retard, com precipitació, com ordre de parada (normalitzat) tenen influència significativa en l'explicació de la variança de les dades originals.
+
+
+### 5.3.3. FAMD - Factor Analysis of Mixed Data
+
+Aquest mètode és una variació de l'ànàlisi de components principals (PCA) per treballar amb datasets que tinguin variables categòriques i numèriques.
+
+
+```{r FAMD}
+
+res.famd2 <- FAMD(dades.w[,c(1,3,7,11,12,14)],  ncp=8, graph=FALSE)
+get_eigenvalue(res.famd2)
+
+# contribució de les variables a les dimensions
+get_famd_var((res.famd2))$contrib
+
+# gràfica amb la primera i segona dimensió
+fviz_famd_var(res.famd2, repel=TRUE)
+
+# contribucions de les variables a cada dimensió
+fviz_contrib(res.famd2, "var", axes=1)
+fviz_contrib(res.famd2, "var", axes=2)
+
+# variables quantitatives
+quanti.var <- get_famd_var(res.famd2,"quanti.var")
+
+fviz_famd_var(res.famd2, "quanti.var", repel=TRUE, col.var="contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+quanti.var$cos2
+
+```
+
+Després de diverses combinacions de variables, la que més variança explica és retard + precipitació + ordre.norm + hora + línia + conductor.
+Tot i així, la contribució és molt pobre, entre un 2 i un 3% per cada vector propi. 
+
+Tant a la taula com a les gràfiques de contribucions, observem que les 4 primeres dimensions tenen una contribució molt forta de les variables línia i conductor (en igual magnitud) i una contribució menys important de l'hora i retard.  
+
+Finalment, els valors de cos2 per a les variables numèriques representen la qualitat de la representació de la variable en les dimensions 1 i 2. La variable amb cos2 més alt és retard, amb 0.23, que indica que com les altres no està ben representada en dos dimensions, (el cos2 seria proper a 1 si ho estigués).
+
+
+### 5.3.4. Kernel Regression
+
+Aquest algorisme es pot aplicar per a obtenir una regressió quan la variable resposta és contínua i les variables predictores són diverses i contenen tant variables contínues com discretes o factors.
+
+```{r kernel regression, eval=FALSE, include=FALSE}
+npregbw(formula = retard ~factor(iIdLinea) + factor(iIdConductor) + prec + ordre.norm + ordered(horaT), data=dades.w, regtype = "lc", nmulti=2)
+
+out <- capture.output(
+   res.kernel <- npregbw(formula = retard ~ factor(iIdLinea) + factor(iIdConductor) + ordre.norm , data=dades.sample5000, regtype="lc", nmulti=2)
+) 
+
+res.kernel
+
+# Regressió
+fit.kernel <- npreg(res.kernel)
+summary(fit.kernel)
+
+# gràfiques dels efectes marginals de cada variable sobre el retard
+plot(fit.kernel, plot.par.mfrow=FALSE)
+
+#J intervals de confiança pels efectes marginals de cada variable sobre el retard
+plot(fit.kernel, plot.errors.method="bootstrap", plot.par.mfrow=FALSE)
+```
+
+Com a resultat de la funció summary obtenim uns coeficients per cada variable que reforcen el protagonisme del conductor i les gràfiques amb els intervals de confiança coincideixen en bona mesura amb les gràfiques descriptives de les dades reals.
+Aquest mètode té una funció predict, que podria estimar els retards mitjans d'un determinat conductor, en una determinada línia i ordre de parada.
+
+Un resultat molt interessant d'aquest anàlisi és l'efecte de l'ordre de la parada (normalitzat en cada línia) en el retard, com mostra que els retards s'acumulen fins cobrir el 75-80% de la línia, moment en que es redueixen fins a valors negatius, reflectint molt probablement la regulació del servei (que un autobús es salti part del trajecte per anar directament a una parada a recuperar horari previst).
+
+No obstant, cal tenir en compte que l'ajust del model a les dades és molt poble (R2 = 0.374)
+
+
+### 5.3.5. Model no supervisat: clustering: hi ha retards diferents en les parades? o en la combinació parada+línia? o parada+línia+expedició?
+
+Per aplicar un mètode de clustering sobre variables mixtes (numèriques, categòriques i factors ordenats) contemplem una funció distància i un algorisme que ho permetin: la distància de Gower i l'algorisme PAM Partitioning around medoids. L'algorisme és robust en front a valors extrems, donat que treballa amb medianes i no amb mitjanes.
+
+```{r clustering mixed data}
+#  matriu amb les distàncies de Gower
+gower_dist <- daisy(dades.sample5000[,c(1,3,5,7,14,12,11)], metric="gower")
+gower_mat <- as.matrix(gower_dist)
+
+# els casos més similars són
+dades.sample5000[which(gower_mat == min(gower_mat[gower_mat != min(gower_mat)]), arr.ind = TRUE)[1, ], ]
+
+# els casos més disimilars són
+dades.sample5000[which(gower_mat == max(gower_mat[gower_mat != max(gower_mat)]), arr.ind = TRUE)[1, ], ]
+
+# escollim el número de clústers més baix amb un bon coeficient silhouette
+sil_width <- c(NA)
+for(i in 2:8){  
+  pam_fit <- pam(gower_dist, diss = TRUE, k = i)  
+  sil_width[i] <- pam_fit$silinfo$avg.width  
+}
+plot(1:8, sil_width,
+     xlab = "Número de clusters",
+     ylab = "Silhouette Width")
+lines(1:8, sil_width)
+
+# k=4 ens dóna el màxim coeficient silhouette
+# descripció de cada cluster
+k=4
+fit.pam <- pam(gower_dist, diss=TRUE, k)
+
+# elements representatius del cluster
+dades.sample5000[fit.pam$medoids,c(1,3,5,7,14,12,11)]
+
+# característiques dels clústers
+fit.pam$clusinfo
+
+# resum dels elements de cada clúster
+res.pam <- dades.sample5000 [,c(1,3,5,7,14,12,11)] %>% 
+  mutate(cluster = fit.pam$clustering) %>% 
+  group_by(cluster) %>% 
+  do (the_summary = summary(.))
+res.pam$the_summary
+
+# visualització en un espai 2D
+tsne_obj <- Rtsne(gower_dist, is_distance=TRUE)
+
+tsne_data <- tsne_obj$Y %>% 
+  data.frame() %>% 
+  setNames(c("X","Y")) %>% 
+  mutate(cluster = factor(fit.pam$clustering))
+
+ggplot(aes(x=X, y=Y), data=tsne_data) +
+  geom_point(aes(color = cluster))
+```
+
+Hem trobat que el número òptim de clústers és k=4, i a la visualització en 2D veiem que estan molt ben diferenciats, excepte el clúster número 1, que està més repartit a l'espai.
+
+### 5.3.6. Correlació: hi ha relació entre els retards i els dies de pluja?
+
+Hem comprovat prèviament que no es compleix el criteri de normalitat i homocedasticitat, de manera que caldrà aplicar la correlació de Spearman, que té com a únic requeriment sobre les dades que es mesurin en una escala ordinal.
+Fem servir el conjunt de dades sense normalitzar i sense valors extrems, per evitar que interfereixin en els coeficients.
+
+```{r correlació, eval=FALSE, include=FALSE}
+cor.test(dades.w.sense.out$retard, dades.w.sense.out$prec, method = "spearman")
+cor.test(dades.w.sense.out$retard, dades.w.sense.out$ordre.norm, method = "spearman")
+
+corrplot::corrplot.mixed(cor(dades.w.sense.out[,c(1,12,14)], method="spearman"))
+
+```
+
+Obtenim com a resultat en els dos casos que es rebutja la hipòtesis nul·la i per tant el coeficient de correlació és significativament diferent de zero,  en els dos casos és una correlació baixa.
+
+Per la variable precipitació, s'estima en -0,1, fet que tot i que sigui el contrari a l'esperat, es pot interpretar com que els valors positius de pluja redueixen el retard en una proporció petita.
+
+Per la variable ordre de parada, a mesura que augmenta el recorregut de la línia augmenta el retard, amb un coeficient de correlació de 0,18.
+
+
+****
+# 6. Representació dels resultats a partir de taules i gràfiques.
+****
+
+La representació gràfica s'ha anat introduïnt en cada apartat.
+
+****
+# 7. Resolució del problema. A partir dels resultats obtinguts
+****
+
+Si bé des de les primeres anàlisis descriptives s'ha intuït una relació del retard amb la línia i el conductor, no s’ha pogut formular aquesta dependència de manera prou senzilla i intuïtiva.
+
+S'ha comprovat també que les distribucions dels retards no segueixen una distribució normal.
+
+La recerca dels factors que més influeixen en els retards ha resultat molt complicada degut a la gran quantitat de variables predictores possibles, i degut a la varietat de tipus. 
+
+Per altra banda, es pot concloure que la L20 té en realitat menys retard que les altres línies, fet contrari al suposat prèviament. Reflexionant sobre aquest fet, ens podem adonar que el model plantejat en aquesta pràctica no reflecteix bé els casos en que un autobús és posat en hora saltant-se part del trajecte: per aquest model, a partir de la regulació, aquella expedició esdevé puntual, mentre que per l'usuari que està esperant a la parada, el servei té un retard important perquè un autobús va tant retrassat que ni passa. Aquest retard no es correspon a cap registre i degut a la quantitat de regulacions de la L20 és molt possible que la puntualitat millori artificialment en aquest anàlisi. En futurs anàlisis, es podria introduir aquest fet assignant un retard important a cada parada on no hagi passat el bus.
+
+Els diferents mètodes d'anàlisi aplicats confirmen la importància de gran quantitat de variables, no essent possible trobar-ne un conjunt petit que expliqui en mesura suficient la variable retard.El mètode de clústering sí que ha separat les dades en 4 grups ben diferenciats, però degut a la tipologia de les dades resulta difícil interpretar el resultat i aplicar-lo a la pràctica. 
+
+Finalment, hem comprovat que la pluja afavoreix lleugerament la puntualitat. No hem introduït les dades dels sensors de trànsit, donat que no hem pogut determinar moments del dia o de la setmana amb pitjor comportament.
+
+Com a conclusió podem dir que no s'ha resolt el problema plantejat, però en canvi s'ha mostrat el camí per a futurs anàlisis.
+
+
+****
+# 8. Referències
+****
+
+Com a material complementari, s'han consultat entre d'altres, els següents recursos:
+
+http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/115-famd-factor-analysis-of-mixed-data-in-r-essentials/#graph-of-individuals
+
+https://cran.r-project.org/web/packages/PCAmixdata/PCAmixdata.pdf
+
+https://bookdown.org/egarpor/PM-UC3M/npreg-multmix.html
+
+https://towardsdatascience.com/clustering-on-mixed-type-data-8bbd0a2569c3
